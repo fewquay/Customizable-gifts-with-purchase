@@ -1,0 +1,414 @@
+//for integrating this into any theme:
+//1.  Fire from ajax cart update
+//2.  Send ajax cart update callback into here to call
+//3.  Fire from /cart page load if it reloads on changes, otherwise ajax cart will handle if it shares
+//4.  Fire from /checkout when changes happen and most likely on page load of each step
+//5.  Must add this to theme.liquid and checkout.liquid since the asset files dont get updated on each page hit
+//			var loggedIn = {% if customer %}true{% else %}false{% endif %};
+
+const ActionEnum = {
+  DELETE: 1, //should always delete by key if possible then order of cart doesnt matter aka we wont have to refetch cart in the middle of all this
+  ADD: 2
+};
+class Item {
+  constructor(variant_id,action) {
+    this.variant_id = variant_id;
+    this.action = action;
+  }
+}
+var gcart; //global the whole time this is running
+var queue = [];
+
+var didAnythingChangeOnThisPage = false;
+var ajaxcartCallback = null;
+
+isSet = function (str) {
+  return (!!str && str.trim().length > 0);
+}
+
+runGWP = function (cartIn,callback) {
+  justRan = true;
+  ajaxcartCallback = callback;
+  gcart = cartIn;
+
+  //set all gwp products in the cart to be deleted, any that are in the current configuration and would still be given will remove these from the queue in preProcessQueue()
+  $.each(gcart.items,function(i,item){
+    if (isGWP(item))
+      remove(item.variant_id);
+  });
+
+  $(gwp_configs).each(function(){
+    var gwp = this;
+    var totalMet = !isSet(gwp.total);
+    var codeMet = !isSet(gwp.code);
+    var purchasedMet = !isSet(gwp.purchased);
+    var beginMet = !isSet(gwp.on);
+    var endMet = !isSet(gwp.off);
+    var requireloggedinMet = !isSet(gwp.requireloggedin);
+    var custom1 = true;
+    var custom2 = true;
+    var custom3 = true;
+    var custom4 = true;
+    var custom5 = true;
+    if (totalMet && codeMet && purchasedMet)
+      return true;   //there are no rules on this gwp
+
+    if (window.location.href.toLowerCase().indexOf('/checkout') == -1 && !codeMet)
+      return true;  //dont run discount code gwps outside of checkout...will be possible if we can inspect the discount code outside of checkout
+
+    if (!totalMet)
+      totalMet = testTotal(gwp.total);
+    if (!codeMet)
+      codeMet = testCode(gwp.code);
+    if (!purchasedMet)
+      purchasedMet = testPurchased(gwp.purchased);
+    if (!beginMet)
+      beginMet = testDate(gwp.on,true);
+    if (!endMet)
+      endMet = testDate(gwp.off);
+    if (!requireloggedinMet)
+      requireloggedinMet = testLoggedIn(gwp.requireloggedin);
+    if (typeof custom1function === 'function')
+      custom1 = custom1function(gwp.custom1);
+    if (typeof custom2function === 'function')
+      custom2 = custom2function(gwp.custom2);
+    if (typeof custom3function === 'function')
+      custom3 = custom3function(gwp.custom3);
+    if (typeof custom4function === 'function')
+      custom4 = custom4function(gwp.custom4);
+    if (typeof custom5function === 'function')
+      custom5 = custom5function(gwp.custom5);
+
+    if (totalMet && codeMet && purchasedMet && beginMet && endMet && custom1 && custom2 && custom3 && custom4 && custom5)
+      give(gwp.gift);   //NEED TO TEST FOR AVAILABILITY IN LIQUID INSTEAD OF ANOTHER AJAX CALL
+    else
+      remove(gwp.gift);    //NEED TO CHECK FOR GWPS SHARING SAME FREE GWP
+  });
+
+  preProcessQueue();
+  processQueue();
+}
+
+testLoggedIn = function (required) {
+  if (required == 'false')
+    return true;
+  return (typeof loggedIn === 'boolean') ? loggedIn : true; //not sure what to default to if the loggedIn var hasnt been set up correctly
+}
+
+testDate = function (dt,after = false) {
+  var ts = Date.parse(dt);
+  var now = Date.now();
+  if (isNaN(ts) || (after && ts > now) || (!after && ts < now))
+    return false;
+
+  return true;
+}
+
+testTotal = function (threshold) {
+  var cartTotal = gcart.total_price;
+
+  threshold = threshold * 100;
+  if (cartTotal >= threshold)
+    return true;
+
+  return false;
+}
+
+testCode = function (code) {
+  var returnValue = false;
+  var arr = code.toString().split(',').map(p=>p.trim().toLowerCase());
+
+  $(".reduction-code__text").each(function() {
+    thiscode = $(this).text().toLowerCase();
+    var val =  code.toLowerCase();
+    if (arr.indexOf(thiscode) > -1)
+    {
+      returnValue = true;
+      return false;
+    }
+  });
+
+  return returnValue; //this is for checkout only unless we start tracking the discount code outside of checkout
+}
+
+testPurchased = function (variant_id) {
+  var returnValue = false;
+  var arr = variant_id.toString().split(',').map(p=>p.trim().toLowerCase());
+
+  $.each(gcart.items,function(i,item){
+    if (arr.indexOf(item.id.toString()) > -1 && !isFree(item)) { //rather arbitrarily returns first one
+      returnValue = true;
+      return false;
+    }
+  });
+
+  return returnValue;
+}
+
+give = function (variant_id) {
+  	var variants = variant_id.toString().split(',');
+  	$(variants).each(function(i,var_id){
+  		var item = new Item(var_id,ActionEnum.ADD);
+  		queue.push(item);
+	});
+}
+
+remove = function (variant_id) {
+  var item = new Item(variant_id,ActionEnum.DELETE);
+  queue.push(item);
+}
+
+preProcessQueue = function () { //this function looks for an add and delete for the same variant_id, and if found removes the delete action
+  for (var i=queue.length-1;i>=0;i--) {
+    if (queue[i].action != ActionEnum.DELETE)
+      continue;
+    var found = false;
+    $(queue).each(function(){
+      if (this.action == ActionEnum.ADD && this.variant_id == queue[i].variant_id)
+        found = true;
+    });
+    if (found)
+      queue.splice(i,1);
+  }
+}
+
+processQueue = function () {
+  if (queue.length == 0) {
+    checkReload();
+    return;
+  }
+
+  var item = queue.shift();
+  switch(item.action){
+    case ActionEnum.DELETE:
+      processRemove(item.variant_id);
+      break;
+    case ActionEnum.ADD:
+      processAdd(item.variant_id);
+      break;
+  }
+  //NEED TO CHECK FOR GWPS SHARING SAME FREE GWP----could do that here by checking remove vs give for same variant ids
+}
+
+processRemove = function (variant) {
+    var key = '';
+    $.each(gcart.items,function(i,item){
+      if (item.id == variant && isFree(item)) { //arbitrarily returns first one
+        key = item.key;
+        return false;
+      }
+    });
+    if (key == '') {
+      processQueue();
+      return;
+    }
+
+    didAnythingChangeOnThisPage = true;
+    $.ajax({
+      url: '/cart/change.js',
+      dataType: 'json',
+      cache: false,
+      type: 'POST',
+      data: { quantity: 0, id: key },
+      success: function (data) {
+        processQueue();
+      },
+      error: function (XMLHttpRequest, textStatus) { //NEED TO HANDLE THIS BETTER
+        processQueue();
+      }
+    });
+}
+
+processAdd = function (variant) {
+  var idx = -1;
+  $.each(gcart.items,function(i,item){
+    if (item.id == variant && isFree(item)) { //arbitrarily returns first one
+      idx = i;
+      return false;
+    }
+  });
+  if(idx != -1) {
+    processQueue();
+    return;
+  }
+
+  var upd = {
+     quantity: 1,
+     id: variant,
+     properties: {
+       'Gift': 'Free',
+       'GWP': 'Yes'
+     }
+  };
+  didAnythingChangeOnThisPage = true;
+  //setTimeout(function(j){
+  $.ajax({
+  type: 'POST',
+  data: upd,
+  url: '/cart/add.js',
+  dataType: 'json',
+  success: function(item) {
+    processQueue();
+  },
+  error: function (XMLHttpRequest, textStatus) { //NEED TO HANDLE THIS BETTER
+    processQueue();
+  }
+});
+  //},1000*i,i);
+}
+
+  isFree = function (lineitem) {
+    var free = false;
+    $.each(lineitem.properties,function(i,prop){
+      if (['Sample'].indexOf(i) > -1) //value doesnt matter, this is just positive affirmation
+        return false;  //dont delete samples from auto gwp logic running      
+      if (['Gift','Percent'].indexOf(i) > -1) //value doesnt matter, this is just positive affirmation
+        free =true;
+    });
+    return free;
+  };
+
+  isGWP = function (lineitem) {
+    var free = false;
+    $.each(lineitem.properties,function(i,prop){
+      if (['GWP'].indexOf(i) > -1) //value doesnt matter, this is just positive affirmation
+        free =true;
+    });
+    return free;
+  };
+
+  /*handleFreeDuplicates = function (cart) {
+    asyncSuccessHandlingNextCall = false;
+    $.each(cart.items,function(ix,item) {
+      if (item.line_price == 0 && item.quantity > 1)
+      {
+        var cartIndex = ix+1;
+        $.ajax({
+          type: 'POST',
+          url: '/cart/change.js',
+          data: { quantity: 1, line: cartIndex },
+          dataType: 'json',
+          success: function(item) {
+            asyncSuccessHandlingNextCall = true;
+            didAnythingChangeOnThisPage = true;
+            Shopify.getCart(gwpByTotalAndCode);
+          },
+          error: function (XMLHttpRequest, textStatus) {
+          }
+        });
+        return false;
+      }
+    });
+    if (!asyncSuccessHandlingNextCall)
+      gwpByTotalAndCode(cart);
+  };*/
+
+  checkReload = function () {  //keep checking to see if the page needs reload after the last possible async call is done
+      if (didAnythingChangeOnThisPage && queue.length == 0) {
+        	didAnythingChangeOnThisPage = false;
+        	setTimeout(function(){  refreshCartDisplay(null,true);	},100);
+      }
+      else if (queue.length > 0) {
+        setTimeout(function(){ checkReload(); },1000);
+      }
+      else {
+        //refreshCartDisplay(gcart); //not great but nothing changed
+      }
+    }
+
+  refreshCartDisplay = function (cart = null,forceReload = false) { //pass in original cart if nothing changed here so that a second cart.js call isnt made?
+      if (ajaxcartCallback && typeof ajaxcartCallback === 'function')
+      {
+        justRan = true;
+        if (cart)
+          ajaxcartCallback(cart);
+        else
+          $.getJSON('/cart.js', (cart) => {   justRan = true; ajaxcartCallback(cart); });
+      }
+      else if (forceReload)
+        window.location.reload();
+    }
+
+   setupCheckoutListener = function () {
+       const intercept = (urlmatch, callback) => {
+         let send = XMLHttpRequest.prototype.send;
+         XMLHttpRequest.prototype.send = function() {
+           this.addEventListener('readystatechange', function() {
+             if (this.responseURL.includes(urlmatch) && this.readyState === 4) {
+               callback(this);
+             }
+           }, false);
+           send.apply(this, arguments);
+         };
+       };
+
+       let output = response => {
+         console.log(response.responseURL);
+         if (response.responseURL.includes('checkouts')) {
+           setTimeout(function() {
+             runGWPWithNoCart();
+           },200);
+         }
+       };
+
+       intercept('.', output);
+   }
+
+class Gwp {
+    constructor(total,code,purchased,gift,on,off,requireloggedin,custom1,custom2,custom3,custom4,custom5) {
+      this.total = total;
+      this.code = code;
+      this.purchased = purchased;
+      this.gift = gift;
+      this.on = on;
+      this.off = off;
+      this.requireloggedin = requireloggedin;
+      this.custom1 = custom1;
+      this.custom2 = custom2;
+      this.custom3 = custom3;
+      this.custom4 = custom4;
+      this.custom5 = custom5;
+    }
+  }
+var gwp_configs = [];
+  {% for i in (1..20) %}
+    {% assign gwp_gift_ = 'gwp_gift_' | append: i %}
+    {% if settings[gwp_gift_] == blank %}
+      {% break %}
+    {% endif %}
+    {% assign gwp_cart_total_ = 'gwp_cart_total_' | append: i %}
+    {% assign gwp_discount_code_ = 'gwp_discount_code_' | append: i %}
+    {% assign gwp_purchased_ = 'gwp_purchased_' | append: i %}
+    {% assign gwp_date_on_ = 'gwp_date_on_' | append: i %}
+    {% assign gwp_date_off_ = 'gwp_date_off_' | append: i %}
+    {% assign gwp_require_logged_in_ = 'gwp_require_logged_in_' | append: i %}
+    {% assign gwp_custom1_ = 'gwp_custom1_' | append: i %}
+    {% assign gwp_custom2_ = 'gwp_custom2_' | append: i %}
+    {% assign gwp_custom3_ = 'gwp_custom3_' | append: i %}
+    {% assign gwp_custom4_ = 'gwp_custom4_' | append: i %}
+    {% assign gwp_custom5_ = 'gwp_custom5_' | append: i %}
+    var gwp = new Gwp('{{ settings[gwp_cart_total_] }}',
+    '{{ settings[gwp_discount_code_] }}',
+    '{{ settings[gwp_purchased_] }}',
+    '{{ settings[gwp_gift_] }}',
+    '{{ settings[gwp_date_on_] }}',
+    '{{ settings[gwp_date_off_] }}',
+    '{{ settings[gwp_require_logged_in_] }}',
+    '{{ settings[gwp_custom1_] }}',
+    '{{ settings[gwp_custom2_] }}',
+    '{{ settings[gwp_custom3_] }}',
+    '{{ settings[gwp_custom4_] }}',
+    '{{ settings[gwp_custom5_] }}'
+    );
+    gwp_configs.push(gwp);
+  {% endfor %}
+
+  $(document).ready(function(){
+    runGWPWithNoCart();  //this is for testing only, this should be called from /cart load, checkout load, or ajaxcart change
+    if (window.location.href.toLowerCase().indexOf('/checkout') > -1)
+      setupCheckoutListener();
+  });
+
+  runGWPWithNoCart = function(callback = null) {
+    $.getJSON('/cart.js', (cart) => { runGWP(cart,callback); });
+  }

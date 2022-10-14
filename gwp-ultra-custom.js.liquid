@@ -1,0 +1,17 @@
+/*
+custom1function = function(valIn) { //works for consumer checkbox in the GWP configuration
+  if (isPro) //if they are a pro user we dont care if it works for consumer or not, so return true
+    return true;
+  return (valIn == 'true');
+}
+
+custom2function = function(valIn) { //works for pro checkbox in the GWP configuration
+  if (!isPro) //if they are a consumer user we dont care if it works for pro or not, so return true
+    return true;
+  return (valIn == 'true');
+}
+*/
+
+rebuildCart = function(cart) {
+    $('body').trigger('cartupdate', cart);
+}
